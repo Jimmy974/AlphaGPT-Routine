@@ -1,8 +1,8 @@
-name: A-Stock AlphaGPT routine
+name: AlphaGPT Routine
 
 on:
   schedule:
-    - cron: '13 8 * * *'
+    - cron: '13 8 * * 1-5'
   workflow_dispatch:
 
 jobs:
@@ -20,10 +20,11 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install torch pandas numpy akshare matplotlib pyarrow tqdm
+          pip install torch pandas numpy akshare matplotlib pyarrow tqdm requests yfinance
 
       - name: Run analysis
         env:
+          MARKET: ${{ vars.MARKET || 'CN' }}
           CODE_FORMULA: ${{ github.event.inputs.code_formula || vars.CODE_FORMULA || secrets.CODE_FORMULA }}
           INDEX_CODE: ${{ vars.INDEX_CODE || secrets.INDEX_CODE || '600901' }}
           START_DATE: ${{ github.event.inputs.start_date || vars.START_DATE || '20220101' }}
@@ -31,17 +32,22 @@ jobs:
           BATCH_SIZE: ${{ vars.BATCH_SIZE || 1024 }}
           TRAIN_ITERATIONS: ${{ vars.TRAIN_ITERATIONS || 100 }}
           MAX_SEQ_LEN: ${{ vars.MAX_SEQ_LEN || 10 }}
-          COST_RATE: ${{ vars.COST_RATE || 0.0004 }}
+          COST_RATE: ${{ vars.COST_RATE || '' }}
           LAST_NDAYS: ${{ vars.LAST_NDAYS || 50 }}
           HOLD_PERIOD: ${{ vars.HOLD_PERIOD || 11 }}
           FORCE_TRAIN: ${{ vars.FORCE_TRAIN || 'False' }}
-          ONLY_LONG: ${{ vars.ONLY_LONG || 'True' }}
+          ONLY_LONG: ${{ vars.ONLY_LONG || '' }}
           BEST_FORMULA: ${{ vars.BEST_FORMULA || secrets.BEST_FORMULA || '' }}
           DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK || '' }}
           DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET || '' }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || '' }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID || '' }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL || '' }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET || '' }}
         run: python times_astock.py
 
-      - name: Commit and push changes
+      - name: Commit and push margin data
+        if: ${{ vars.MARKET == 'CN' || vars.MARKET == '' }}
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"

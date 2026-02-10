@@ -1,0 +1,69 @@
+{
+  "name": "AlphaGPT Telegram Notifier",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "alphagpt-signal",
+        "responseMode": "onReceived",
+        "responseData": "allEntries",
+        "options": {}
+      },
+      "id": "webhook-trigger",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [250, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json.body;\nconst data = body.data;\n\nlet lines = [`<b>📊 AlphaGPT Strategy [${data.index_code}]</b>`, ''];\n\nfor (const t of data.trades) {\n  let indicator = '—';\n  let retDisplay = '0.00%';\n  if (t.return_pct > 0) {\n    indicator = '▲';\n    retDisplay = '+' + (t.return_pct * 100).toFixed(2) + '%';\n  } else if (t.return_pct < 0) {\n    indicator = '▼';\n    retDisplay = (t.return_pct * 100).toFixed(2) + '%';\n  }\n  const posInfo = `Pos: ${t.position}`;\n  const entryInfo = `Entry: ${t.entry_price}`;\n  let exitInfo = `Hold Days: ${t.exit_offset || 'N/A'}`;\n  if (t.exit_date !== 'N/A') {\n    exitInfo = `Exit: ${t.exit_price} (${t.exit_date})`;\n  }\n  lines.push(`📅 ${t.date} ${posInfo} | Return: ${indicator} <b>${retDisplay}</b> ${entryInfo} | ${exitInfo}`);\n}\n\nlines.push('');\nlines.push('<b>📈 Summary</b>');\n\nconst s = data.summary;\nif (s) {\n  lines.push(`  Investments: ${s.investment_count}`);\n  lines.push(`  Profits: ${s.profit_count}`);\n  lines.push(`  Win Rate: <b>${(s.win_rate * 100).toFixed(2)}%</b>`);\n  lines.push(`  Simple Return: <b>${(s.simple_return * 100).toFixed(2)}%</b>`);\n  lines.push(`  Compound Return: <b>${(s.compound_return * 100).toFixed(2)}%</b>`);\n} else {\n  lines.push('No active trades');\n}\n\nreturn [{ json: { message: lines.join('\\n'), chatId: $env.TELEGRAM_CHAT_ID || '' } }];"
+      },
+      "id": "format-message",
+      "name": "Format Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [500, 300]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "HTML",
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "send-telegram",
+      "name": "Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [750, 300],
+      "credentials": {
+        "telegramApi": {
+          "id": "REPLACE_WITH_YOUR_CREDENTIAL_ID",
+          "name": "Telegram Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [{ "node": "Format Message", "type": "main", "index": 0 }]
+      ]
+    },
+    "Format Message": {
+      "main": [
+        [{ "node": "Telegram", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    { "name": "AlphaGPT" },
+    { "name": "Trading Signals" }
+  ]
+}

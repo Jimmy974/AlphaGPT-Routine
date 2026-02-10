@@ -25,26 +25,222 @@ def _get_env(key, default, cast_type=str):
         return val.lower() in ('true', 'yes') # 布尔值支持多种写法
     return cast_type(val)
 
-INDEX_CODE = _get_env('INDEX_CODE', '000001')
-START_DATE = _get_env('START_DATE', '20220101') # 训练数据开始：近10年
+MARKET = _get_env('MARKET', 'CN')  # 'CN', 'HK', or 'US'
+
+# --- MarketProvider: encapsulates market-specific data fetching & defaults ---
+class MarketProvider:
+    col_map = {}
+    default_index = ''
+    default_cost_rate = 0.0
+    default_only_long = True
+    benchmark_label = 'Benchmark'
+    has_margin_data = False
+    has_limit_moves = False
+
+    def fetch_ohlcv(self, code, start, end):
+        raise NotImplementedError
+
+    def fetch_margin_data(self, code, date_list):
+        return None
+
+    def normalize_columns(self, df):
+        return df.rename(columns=self.col_map)
+
+class CNProvider(MarketProvider):
+    col_map = {'日期': 'date', '开盘': 'open', '最高': 'high',
+               '最低': 'low', '收盘': 'close', '成交量': 'volume'}
+    default_index = '000001'
+    default_cost_rate = 0.0004
+    default_only_long = True
+    benchmark_label = 'Benchmark (CSI 300)'
+    has_margin_data = True
+    has_limit_moves = True
+
+    def fetch_ohlcv(self, code, start, end):
+        df = None
+        try:
+            df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
+        except:
+            pass
+        if df is None or df.empty:
+            try:
+                df = ak.index_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end)
+            except:
+                pass
+        if df is None or df.empty:
+            try:
+                df = ak.fund_etf_hist_em(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
+            except:
+                pass
+        if df is None or df.empty:
+            try:
+                df = ak.fund_lof_hist_em(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
+            except:
+                pass
+        return df
+
+    def fetch_margin_data(self, code, date_list):
+        return get_margin_balance(code, date_list)
+
+class HKProvider(MarketProvider):
+    col_map = {'日期': 'date', '开盘': 'open', '最高': 'high',
+               '最低': 'low', '收盘': 'close', '成交量': 'volume'}
+    default_index = '00700'
+    default_cost_rate = 0.0025
+    default_only_long = False
+    benchmark_label = 'Benchmark (HSI)'
+
+    def fetch_ohlcv(self, code, start, end):
+        try:
+            return ak.stock_hk_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
+        except:
+            return None
+
+class USProvider(MarketProvider):
+    col_map = {'Date': 'date', 'Open': 'open', 'High': 'high',
+               'Low': 'low', 'Close': 'close', 'Volume': 'volume'}
+    default_index = 'SPY'
+    default_cost_rate = 0.0
+    default_only_long = False
+    benchmark_label = 'Benchmark (S&P 500)'
+
+    def fetch_ohlcv(self, code, start, end):
+        import yfinance as yf
+        try:
+            ticker = yf.Ticker(code)
+            df = ticker.history(start=pd.to_datetime(start, format='%Y%m%d'),
+                                end=pd.to_datetime(end, format='%Y%m%d'))
+            if df is not None and not df.empty:
+                return df.reset_index()
+        except:
+            pass
+        return None
+
+_PROVIDERS = {'CN': CNProvider, 'HK': HKProvider, 'US': USProvider}
+provider = _PROVIDERS[MARKET]()
+
+INDEX_CODE = _get_env('INDEX_CODE', provider.default_index)
+START_DATE = _get_env('START_DATE', '20220101') # 训练数据开始
 END_DATE = _get_env('END_DATE', '20270101') # 训练数据结束
 BATCH_SIZE = _get_env('BATCH_SIZE', 1024, int)
 TRAIN_ITERATIONS = _get_env('TRAIN_ITERATIONS', 100, int)
 MAX_SEQ_LEN = _get_env('MAX_SEQ_LEN', 10, int)
-COST_RATE = _get_env('COST_RATE', 0.0004, float)
+COST_RATE = _get_env('COST_RATE', provider.default_cost_rate, float)
 LAST_NDAYS = _get_env('LAST_NDAYS', 42, int)      # 用于展示最近交易日的数量（默认42个交易日，约2个月）
 HOLD_PERIOD = _get_env('HOLD_PERIOD', 11, int)     # 持仓周期（包含买入当天后的第2..第HOLD_PERIOD天作为卖出候选）
 FORCE_TRAIN = _get_env('FORCE_TRAIN', False, bool)  # 若为False且存在本地公式，则直接加载；若为True则强制重新训练
-ONLY_LONG = _get_env('ONLY_LONG', True, bool)     # 是否仅做多，适配A股市场
+ONLY_LONG = _get_env('ONLY_LONG', provider.default_only_long, bool)
 BEST_FORMULA = _get_env('BEST_FORMULA', '')       # 环境变量公式
 
 DINGTALK_WEBHOOK = _get_env('DINGTALK_WEBHOOK', '')
 DINGTALK_SECRET = _get_env('DINGTALK_SECRET', '')
+TELEGRAM_BOT_TOKEN = _get_env('TELEGRAM_BOT_TOKEN', '')
+TELEGRAM_CHAT_ID = _get_env('TELEGRAM_CHAT_ID', '')
+WEBHOOK_URL = _get_env('WEBHOOK_URL', '')
+WEBHOOK_SECRET = _get_env('WEBHOOK_SECRET', '')
 
-def send_dingtalk_msg(text):
+# --- Notification label sets per market ---
+_LABELS = {
+    'CN': {'pos': '持仓', 'entry': '入场', 'exit': '离场', 'hold_days': '持仓天数',
+            'ret': '收益', 'inv_count': '投资次数', 'profit_count': '盈利次数',
+            'win_rate': '胜率', 'simple_ret': '简单收益', 'compound_ret': '复合收益',
+            'no_trades': '无有效交易'},
+    '_EN': {'pos': 'Pos', 'entry': 'Entry', 'exit': 'Exit', 'hold_days': 'Hold Days',
+            'ret': 'Return', 'inv_count': 'Investments', 'profit_count': 'Profits',
+            'win_rate': 'Win Rate', 'simple_ret': 'Simple Return', 'compound_ret': 'Compound Return',
+            'no_trades': 'No active trades'},
+}
+_LBL = _LABELS.get(MARKET, _LABELS['_EN'])
+
+# Color convention: CN = red up / green down; HK/US = green up / red down
+if MARKET == 'CN':
+    _UP_COLOR, _DOWN_COLOR = "#FF0000", "#008000"
+else:
+    _UP_COLOR, _DOWN_COLOR = "#008000", "#FF0000"
+
+def _build_notification_data(index_code, trades_data, summary_data, formula_str=''):
+    return {
+        "source": "AlphaGPT",
+        "index_code": index_code,
+        "generated_at": datetime.now().isoformat(),
+        "formula": formula_str,
+        "trades": trades_data,
+        "summary": summary_data,
+    }
+
+def _format_dingtalk(data):
+    lines = [f"## 📊 AlphaGPT Strategy [{data['index_code']}]", ""]
+    for t in data["trades"]:
+        ret_val = t["return_pct"]
+        if ret_val > 0:
+            color, ret_display = _UP_COLOR, f"+{ret_val:.2%}"
+        elif ret_val < 0:
+            color, ret_display = _DOWN_COLOR, f"{ret_val:.2%}"
+        else:
+            color, ret_display = "#000000", "0.00%"
+        pos_info = f"{_LBL['pos']}: {t['position']}"
+        entry_info = f"{_LBL['entry']}: {t['entry_price']}"
+        if t["exit_date"] != 'N/A' and t["exit_date"] != t["date"]:
+            exit_info = f"{_LBL['exit']}: {t['exit_price']} ({t['exit_date']})"
+        else:
+            offset = t['exit_offset']
+            exit_info = f"{_LBL['hold_days']}: {offset if offset is not None else 'N/A'}"
+        lines.append(
+            f"- 📅 {t['date']} {pos_info} | "
+            f"{_LBL['ret']}: <font color=\"{color}\">{ret_display}</font> "
+            f"{entry_info} | {exit_info}"
+        )
+    lines.append("")
+    lines.append("### 📈 Summary")
+    s = data["summary"]
+    if s:
+        lines.append(f"- **{_LBL['inv_count']}**: {s['investment_count']}")
+        lines.append(f"- **{_LBL['profit_count']}**: {s['profit_count']}")
+        lines.append(f"- **{_LBL['win_rate']}**: {s['win_rate']:.2%}")
+        lines.append(f"- **{_LBL['simple_ret']}**: {s['simple_return']:.2%}")
+        lines.append(f"- **{_LBL['compound_ret']}**: {s['compound_return']:.2%}")
+    else:
+        lines.append(_LBL['no_trades'])
+    return "\n".join(lines)
+
+def _format_telegram(data):
+    lines = [f"<b>📊 AlphaGPT Strategy [{data['index_code']}]</b>", ""]
+    for t in data["trades"]:
+        ret_val = t["return_pct"]
+        if ret_val > 0:
+            indicator, ret_display = "▲", f"+{ret_val:.2%}"
+        elif ret_val < 0:
+            indicator, ret_display = "▼", f"{ret_val:.2%}"
+        else:
+            indicator, ret_display = "—", "0.00%"
+        pos_info = f"{_LBL['pos']}: {t['position']}"
+        entry_info = f"{_LBL['entry']}: {t['entry_price']}"
+        if t["exit_date"] != 'N/A' and t["exit_date"] != t["date"]:
+            exit_info = f"{_LBL['exit']}: {t['exit_price']} ({t['exit_date']})"
+        else:
+            offset = t['exit_offset']
+            exit_info = f"{_LBL['hold_days']}: {offset if offset is not None else 'N/A'}"
+        lines.append(
+            f"📅 {t['date']} {pos_info} | "
+            f"{_LBL['ret']}: {indicator} <b>{ret_display}</b> "
+            f"{entry_info} | {exit_info}"
+        )
+    lines.append("")
+    lines.append("<b>📈 Summary</b>")
+    s = data["summary"]
+    if s:
+        lines.append(f"  {_LBL['inv_count']}: {s['investment_count']}")
+        lines.append(f"  {_LBL['profit_count']}: {s['profit_count']}")
+        lines.append(f"  {_LBL['win_rate']}: <b>{s['win_rate']:.2%}</b>")
+        lines.append(f"  {_LBL['simple_ret']}: <b>{s['simple_return']:.2%}</b>")
+        lines.append(f"  {_LBL['compound_ret']}: <b>{s['compound_return']:.2%}</b>")
+    else:
+        lines.append(_LBL['no_trades'])
+    return "\n".join(lines)
+
+def _send_dingtalk(text):
     if not DINGTALK_WEBHOOK:
         return
-    
     url = DINGTALK_WEBHOOK
     if DINGTALK_SECRET:
         timestamp = str(round(time.time() * 1000))
@@ -54,7 +250,6 @@ def send_dingtalk_msg(text):
         hmac_code = hmac.new(secret_enc, string_to_sign_enc, digestmod=hashlib.sha256).digest()
         sign = urllib.parse.quote(base64.b64encode(hmac_code))
         url = f"{DINGTALK_WEBHOOK}&timestamp={timestamp}&sign={sign}"
-
     headers = {'Content-Type': 'application/json'}
     data = {
         "msgtype": "markdown",
@@ -68,6 +263,53 @@ def send_dingtalk_msg(text):
         print(f"DingTalk notification sent, status: {resp.status_code}")
     except Exception as e:
         print(f"Failed to send DingTalk notification: {e}")
+
+def _send_telegram(html_text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    # Telegram has a 4096-char limit; truncate if needed
+    if len(html_text) > 4000:
+        html_text = html_text[:3950] + "\n\n<b>... (message truncated)</b>"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": html_text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=10)
+        result = resp.json()
+        if result.get("ok"):
+            print(f"Telegram notification sent, message_id: {result['result']['message_id']}")
+        else:
+            print(f"Telegram API error: {result.get('description', 'unknown error')}")
+    except Exception as e:
+        print(f"Failed to send Telegram notification: {e}")
+
+def _send_webhook(data):
+    if not WEBHOOK_URL:
+        return
+    payload = {"event": "strategy_signal", "version": "1.0", "data": data}
+    body = json.dumps(payload, ensure_ascii=False)
+    headers = {'Content-Type': 'application/json'}
+    if WEBHOOK_SECRET:
+        sig = hmac.new(WEBHOOK_SECRET.encode('utf-8'), body.encode('utf-8'),
+                       digestmod=hashlib.sha256).hexdigest()
+        headers['X-Signature-256'] = f"sha256={sig}"
+    try:
+        resp = requests.post(WEBHOOK_URL, headers=headers, data=body, timeout=10)
+        print(f"Webhook notification sent, status: {resp.status_code}")
+    except Exception as e:
+        print(f"Failed to send webhook notification: {e}")
+
+def dispatch_notifications(data):
+    if DINGTALK_WEBHOOK:
+        _send_dingtalk(_format_dingtalk(data))
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        _send_telegram(_format_telegram(data))
+    if WEBHOOK_URL:
+        _send_webhook(data)
 
 DATA_CACHE_PATH = INDEX_CODE + '_data_cache_final.parquet'
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -143,40 +385,25 @@ class DataEngine:
     def __init__(self):
         pass
     def load(self):
-        print(f"Fetching Data of {INDEX_CODE}...")
+        print(f"Fetching Data of {INDEX_CODE} (Market: {MARKET})...")
 
-        df = ak.stock_zh_a_hist(symbol=INDEX_CODE, period="daily", start_date=START_DATE, end_date=END_DATE, adjust="qfq")
+        df = provider.fetch_ohlcv(INDEX_CODE, START_DATE, END_DATE)
         if df is None or df.empty:
-            try:
-                df = ak.index_zh_a_hist(symbol=INDEX_CODE, period="daily", start_date=START_DATE, end_date=END_DATE)
-            except:
-                pass
-        if df is None or df.empty:
-            try:
-                df = ak.fund_etf_hist_em(symbol=INDEX_CODE, period="daily", start_date=START_DATE, end_date=END_DATE, adjust="qfq")
-            except:
-                pass
-        if df is None or df.empty:
-            try:
-                df = ak.fund_lof_hist_em(symbol=INDEX_CODE, period="daily", start_date=START_DATE, end_date=END_DATE, adjust="qfq")
-            except:
-                pass
-        if df is None or df.empty:
-            raise ValueError("未获取到数据，请检查接口调用或网络是否正常")
+            raise ValueError(f"No data retrieved for {INDEX_CODE} in market {MARKET}. Check API or network.")
 
-        df = df.sort_values('日期').reset_index(drop=True)
-        # df.to_parquet(DATA_CACHE_PATH)
+        df = provider.normalize_columns(df)
+        df = df.sort_values('date').reset_index(drop=True)
 
-        for col in ['开盘', '最高', '最低', '收盘', '成交量']:
+        for col in ['open', 'high', 'low', 'close', 'volume']:
             df[col] = pd.to_numeric(df[col], errors='coerce').ffill().bfill()
 
-        self.dates = pd.to_datetime(df['日期'])
+        self.dates = pd.to_datetime(df['date'])
 
-        close = df['收盘'].values.astype(np.float32)
-        open_ = df['开盘'].values.astype(np.float32)
-        high = df['最高'].values.astype(np.float32)
-        low = df['最低'].values.astype(np.float32)
-        vol = df['成交量'].values.astype(np.float32)
+        close = df['close'].values.astype(np.float32)
+        open_ = df['open'].values.astype(np.float32)
+        high = df['high'].values.astype(np.float32)
+        low = df['low'].values.astype(np.float32)
+        vol = df['volume'].values.astype(np.float32)
 
         # 特征因子'RET'
         ret = np.zeros_like(close)
@@ -203,8 +430,12 @@ class DataEngine:
         trend = np.nan_to_num(trend).astype(np.float32)
 
         # 特征因子'F_BUY_F_REPLAY'
-        f_balance,f_buy,f_replay,s_balance = get_margin_balance(INDEX_CODE, pd.to_datetime(df['日期']).dt.strftime('%Y%m%d').tolist())
-        f_buy_f_replay = f_buy - f_replay
+        margin_result = provider.fetch_margin_data(INDEX_CODE, pd.to_datetime(df['date']).dt.strftime('%Y%m%d').tolist())
+        if margin_result is not None:
+            f_balance, f_buy, f_replay, s_balance = margin_result
+            f_buy_f_replay = f_buy - f_replay
+        else:
+            f_buy_f_replay = torch.zeros(len(df), dtype=torch.float32, device=DEVICE)
 
         # 计算oto收益率
         # 可配置持仓周期：若 signal 表示持仓 1，则在 next-open 买入，
@@ -641,14 +872,13 @@ def final_reality_check(miner, engine):
         short_t = engine.target_oto_ret_short[split:].cpu().numpy()
         test_ret = np.where(position == 1, long_t, np.where(position == -1, short_t, np.zeros_like(long_t)))
 
-    # 检查涨跌停/停牌 (Limit Move Check)
-    # 模拟：如果 next_open 相对于 close 涨跌幅超过 9.5%，则无法成交
-    # raw_close[t], raw_open[t+1]
-    # 我们检查 t+1 开盘是否可交易。
-
-    raw_close = engine.raw_close[split:].cpu().numpy()
-    raw_open_next = engine.raw_open[split:].cpu().numpy() # 这里稍微错位，简化处理
-    # 实际上，DataEngine需要更精细的时间对齐来做Limit Check，这里做个简单近似
+    # 检查涨跌停/停牌 (Limit Move Check — A-share only)
+    if provider.has_limit_moves:
+        # 模拟：如果 next_open 相对于 close 涨跌幅超过 9.5%，则无法成交
+        # raw_close[t], raw_open[t+1]
+        raw_close = engine.raw_close[split:].cpu().numpy()
+        raw_open_next = engine.raw_open[split:].cpu().numpy() # 这里稍微错位，简化处理
+        # 实际上，DataEngine需要更精细的时间对齐来做Limit Check，这里做个简单近似
 
     # 换手
     turnover = np.abs(position - np.roll(position, 1))
@@ -734,7 +964,7 @@ def final_reality_check(miner, engine):
     # 基准也应该是 Open-to-Open
     bench_ret = test_ret
     bench_equity = (1 + bench_ret).cumprod()
-    plt.plot(test_dates, bench_equity, label='Benchmark (CSI 300)', alpha=0.5, linewidth=1)
+    plt.plot(test_dates, bench_equity, label=provider.benchmark_label, alpha=0.5, linewidth=1)
     
     plt.title(f'Strict OOS Backtest: Ann Ret {ann_ret:.1%} | Sharpe {sharpe:.3f}')
     plt.legend()
@@ -803,8 +1033,8 @@ def show_latest_positions(miner, engine, n_days=5):
     investment_count = 0  # position=1的次数
     profit_count = 0      # position=1且收益>0的次数
     
-    # 用于发送钉钉的 Markdown 格式行列表
-    markdown_lines = []
+    # 用于通知的结构化交易数据
+    trades_data = []
     
     for i in range(start_idx, len(test_dates)):
         date_str = test_dates.iloc[i].strftime('%Y-%m-%d')
@@ -917,31 +1147,22 @@ def show_latest_positions(miner, engine, n_days=5):
                     exit_date = test_dates.iloc[exit_date_idx].strftime('%Y-%m-%d')
                 exit_open = f"{all_open[exit_idx]:.3f}" if exit_idx < len(all_open) else 'N/A'
 
-        # 构建 Markdown 格式的行
+        # 收集结构化交易数据用于通知
         if i < len(test_ret):
             ret_value = test_ret[i]
-            # 根据收益值选择颜色：正收益红色（涨），负收益绿色（跌），零为黑色
-            if ret_value > 0:
-                color = "#FF0000"  # 红色表示涨
-                ret_display = f"+{ret_value:.2%}"
-            elif ret_value < 0:
-                color = "#008000"  # 绿色表示跌
-                ret_display = f"{ret_value:.2%}"
-            else:
-                color = "#000000"  # 黑色表示平
-                ret_display = "0.00%"
-            
-            # 根据仓位构建信息
-            pos_info = f"持仓: {int(pos_value)}"
-            entry_info = f"入场: {d1_open}"
-            
+            exit_date_short = 'N/A'
             if exit_date != 'N/A' and exit_date != date_str:
-                exit_info = f"离场: {exit_open} ({exit_date.split('-')[1]}-{exit_date.split('-')[2]})"
-            else:
-                exit_info = f"持仓天数: {int(chosen_offset) if chosen_offset and chosen_offset != 'N/A' else 'N/A'}"
-            
-            markdown_line = f"- 📅 {date_str} {pos_info} | 收益: <font color=\"{color}\">{ret_display}</font> {entry_info} | {exit_info}"
-            markdown_lines.append(markdown_line)
+                parts = exit_date.split('-')
+                exit_date_short = f"{parts[1]}-{parts[2]}"
+            trades_data.append({
+                "date": date_str,
+                "position": int(pos_value),
+                "return_pct": float(ret_value),
+                "entry_price": d1_open,
+                "exit_price": exit_open,
+                "exit_date": exit_date_short,
+                "exit_offset": int(chosen_offset) if chosen_offset and chosen_offset != 'N/A' else None,
+            })
         
         # 保持原有的日志打印（不含表头和分隔线）
         if i == start_idx:
@@ -963,25 +1184,20 @@ def show_latest_positions(miner, engine, n_days=5):
         log_print("No active trades in the selected period.")
     log_print("="*30 + "\n")
 
-    # 发送钉钉消息（Markdown 格式）
-    if DINGTALK_WEBHOOK:
-        # 构建 Markdown 格式的钉钉消息
-        dingtalk_msg_lines = [f"## 📊 AlphaGPT Strategy [{INDEX_CODE}]", ""]
-        dingtalk_msg_lines.extend(markdown_lines)
-        dingtalk_msg_lines.append("")
-        dingtalk_msg_lines.append("### 📈 Summary")
-        if valid_days > 0 and investment_count > 0:
-            win_rate = profit_count / investment_count
-            dingtalk_msg_lines.append(f"- **投资次数**: {investment_count}")
-            dingtalk_msg_lines.append(f"- **盈利次数**: {profit_count}")
-            dingtalk_msg_lines.append(f"- **胜率**: {win_rate:.2%}")
-            dingtalk_msg_lines.append(f"- **简单收益**: {simple_sum_return:.2%}")
-            dingtalk_msg_lines.append(f"- **复合收益**: {(compound_equity - 1):.2%}")
-        else:
-            dingtalk_msg_lines.append("无有效交易")
-        
-        full_msg = "\n".join(dingtalk_msg_lines)
-        send_dingtalk_msg(full_msg)
+    # 发送通知到所有已配置的渠道 (DingTalk / Telegram / Webhook)
+    summary_data = None
+    if valid_days > 0 and investment_count > 0:
+        summary_data = {
+            "valid_days": valid_days,
+            "investment_count": investment_count,
+            "profit_count": profit_count,
+            "win_rate": profit_count / investment_count,
+            "simple_return": simple_sum_return,
+            "compound_return": compound_equity - 1,
+        }
+    formula_str = miner.decode(miner.best_formula_tokens) if miner.best_formula_tokens is not None else ''
+    notification_data = _build_notification_data(INDEX_CODE, trades_data, summary_data, formula_str)
+    dispatch_notifications(notification_data)
 
 
 def get_margin_balance(stock_code, date_list):
